@@ -1,0 +1,330 @@
+---
+- name: Setup LAMP stack with WordPress on Amazon Linux 2(for RHEL)
+  hosts: all
+  become: yes
+
+  vars:
+    mysql_root_password: "chinju123"
+    phpmyadmin_password: "chinju123"
+    sftp_password: "chinju123"
+    wordpress_db_password: "chinju123"
+    domain_name: "chinjublogs.online"
+    chinju_home: "/home/chinju"
+    website_root: "/home/chinju/mywebsite/public"
+
+  tasks:
+  - name: Install and Enable PHP 8
+    command: amazon-linux-extras enable php8.0
+
+  - name: Install EPEL release repository
+    yum:
+      name: epel-release
+      state: present
+
+  - name: Install Nginx, PHP8, MySQL, and Certbot for SSL
+    yum:
+      name:
+        - nginx
+        - php
+        - php-mysqlnd
+        - php-fpm
+        - mariadb
+        - mariadb-server
+        - certbot
+        - certbot-nginx
+        - python2-pip
+        - MySQL-python
+      state: present
+
+  - name: Install required Python packages
+    pip:
+      name: MySQL-python
+      state: present
+      executable: /usr/bin/pip2
+  
+  - name: Install Git
+    yum:
+      name: git
+      state: present
+
+  - name: Start and enable services Nginx, PHP, MariaDB
+    systemd:
+      name: "{{ item }}"
+      state: started
+      enabled: yes
+    loop:
+      - nginx
+      - mariadb
+      - php-fpm
+
+  - name: Ensure MariaDB is running
+    systemd:
+      name: mariadb
+      state: started
+      enabled: yes
+  
+  - name: Initialize MySQL data directory
+    command: mysql_install_db
+    args:
+      creates: /var/lib/mysql/mysql
+
+  - name: Start MariaDB service
+    systemd:
+      name: mariadb
+      state: started
+      enabled: yes
+
+  - name: Set MySQL root password and secure installation
+    mysql_user:
+      login_user: root
+      login_password: "{{ mysql_root_password }}"
+      user: root
+      password: "{{ mysql_root_password }}"
+      host_all: yes
+      state: present
+
+  - name: Remove anonymous MySQL users
+    mysql_user:
+      name: ''
+      host_all: yes
+      state: absent
+      login_user: root
+      login_password: "{{ mysql_root_password }}"
+
+  - name: Remove MySQL test database
+    mysql_db:
+      name: test
+      state: absent
+      login_user: root
+      login_password: "{{ mysql_root_password }}"
+
+  - name: Create MySQL Database and user 'root' for WordPress
+    mysql_db:
+      name: wordpress
+      state: present
+      login_user: root
+      login_password: "{{ mysql_root_password }}"
+
+  - name: Create WordPress MySQL user 'wordpress'
+    mysql_user:
+      name: wordpress
+      password: "{{ wordpress_db_password }}"
+      priv: "wordpress.*:ALL"
+      state: present
+      login_user: root
+      login_password: "{{ mysql_root_password }}"
+
+  - name: Create user 'chinju' for SFTP
+    user:
+      name: chinju
+      home: "{{ chinju_home }}"
+      shell: /bin/bash
+      create_home: yes
+      password: "{{ sftp_password | password_hash('sha512') }}"
+
+  - name: Set up website directory
+    file:
+      path: "{{ website_root }}"
+      state: directory
+      owner: chinju
+      group: chinju
+      mode: '0755'
+    notify: Restart sshd
+
+  - name: Ensure sshd_config.d directory exists
+    file:
+      path: /etc/ssh/sshd_config.d
+      state: directory
+
+  - name: Set up SFTP access
+    copy:
+      content: |
+        Match User chinju
+        ChrootDirectory {{ chinju_home }}
+        ForceCommand internal-sftp
+        AllowTcpForwarding no
+        PermitTunnel no
+        X11Forwarding no
+      dest: /etc/ssh/sshd_config.d/sftp_chinju.conf
+
+  - name: Ensure fastcgi-php.conf exists
+    copy:
+      content: |
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        include fastcgi_params;
+      dest: /etc/nginx/snippets/fastcgi-php.conf
+      owner: root
+      group: root
+      mode: '0644'
+ 
+  - name: Install phpMyAdmin
+    get_url:
+      url: https://www.phpmyadmin.net/downloads/phpMyAdmin-latest-all-languages.tar.gz
+      dest: /tmp/phpMyAdmin.tar.gz
+
+  - name: Extract phpMyAdmin
+    unarchive:
+      src: /tmp/phpMyAdmin.tar.gz
+      dest: /usr/share/
+      remote_src: yes
+      creates: /usr/share/phpMyAdmin
+
+  - name: Ensure phpMyAdmin directory exists
+    file:
+      path: /usr/share/phpMyAdmin
+      state: directory
+
+  - name: Copy phpMyAdmin files
+    copy:
+      src: /usr/share/phpMyAdmin-5.2.1-all-languages/
+      dest: /usr/share/phpMyAdmin/
+      remote_src: yes
+      force: yes
+
+  - name: Create phpMyAdmin config file
+    copy:
+      content: |
+        <?php
+        $cfg['blowfish_secret'] = '{{ phpmyadmin_password }}';
+        $i = 0;
+        $i++;
+        $cfg['Servers'][$i]['auth_type'] = 'cookie';
+        $cfg['Servers'][$i]['user'] = 'root';
+        $cfg['Servers'][$i]['password'] = '{{ mysql_root_password }}';
+        $cfg['Servers'][$i]['host'] = 'localhost';
+        $cfg['Servers'][$i]['AllowNoPassword'] = false;
+      dest: /usr/share/phpMyAdmin/config.inc.php
+      owner: nginx
+      group: nginx
+      mode: '0644'
+
+  - name: Configure Nginx for WordPress
+    copy:
+      content: |
+        server {
+           server_name {{ domain_name }};
+           root {{ website_root }}/wordpress;
+           index index.php index.html index.htm;
+
+           # WordPress configuration
+           location / {
+               try_files $uri $uri/ /index.php?$args;
+           }
+
+           location ~ \.php$ {
+               include snippets/fastcgi-php.conf;
+               fastcgi_pass unix:/run/php-fpm/www.sock;
+           }
+
+           location ~ /\.ht {
+               deny all;
+           }
+
+           # phpMyAdmin configuration
+           location /phpmyadmin {
+               alias /usr/share/phpMyAdmin/;
+               index index.php index.html index.htm;
+
+               location ~ ^/phpmyadmin/(.+\.php)$ {
+                   alias /usr/share/phpMyAdmin/$1;
+                   include snippets/fastcgi-php.conf;
+                   fastcgi_pass unix:/run/php-fpm/www.sock;
+                   fastcgi_param SCRIPT_FILENAME $request_filename;
+                   include fastcgi_params;
+               }
+
+          # Disable directory listing for phpMyAdmin
+               location ~ ^/phpmyadmin/(index\.php)?$ {
+                   deny all;
+                   include snippets/fastcgi-php.conf;
+                   fastcgi_pass unix:/run/php-fpm/www.sock;
+                   fastcgi_param SCRIPT_FILENAME $request_filename;
+                   include fastcgi_params;
+               }
+               location ~* ^/phpmyadmin/(.+\.(jpg|jpeg|gif|css|png|js|ico|html|xml|txt))$ {
+                   alias /usr/share/phpMyAdmin/$1;
+               }
+          }
+        }  
+      dest: /etc/nginx/conf.d/{{ domain_name }}.conf
+      owner: root
+      group: root
+      mode: '0644'
+  
+  - name: Obtain SSL certificate
+    command: certbot --nginx -d {{ domain_name }} --non-interactive --agree-tos -m admin@{{ domain_name }}
+
+  - name: Download and extract WordPress
+    unarchive:
+      src: https://wordpress.org/latest.tar.gz
+      dest: "{{ website_root }}"
+      remote_src: yes
+      creates: "{{ website_root }}/wordpress"
+
+  - name: Configure WordPress wp-config.php
+    copy:
+      content: |
+        <?php
+        define('DB_NAME', 'wordpress');
+        define('DB_USER', 'wordpress');
+        define('DB_PASSWORD', '{{ wordpress_db_password }}');
+        define('DB_HOST', 'localhost');
+        define('DB_CHARSET', 'utf8');
+        define('DB_COLLATE', '');
+        define('AUTH_KEY', 'put your unique phrase here');
+        define('SECURE_AUTH_KEY', 'put your unique phrase here');
+        define('LOGGED_IN_KEY', 'put your unique phrase here');
+        define('NONCE_KEY', 'put your unique phrase here');
+        define('AUTH_SALT', 'put your unique phrase here');
+        define('SECURE_AUTH_SALT', 'put your unique phrase here');
+        define('LOGGED_IN_SALT', 'put your unique phrase here');
+        define('NONCE_SALT', 'put your unique phrase here');
+        $table_prefix = 'wp_';
+        define('WP_DEBUG', false);
+        if ( !defined('ABSPATH') )
+            define('ABSPATH', dirname(__FILE__) . '/');
+        require_once(ABSPATH . 'wp-settings.php');
+      dest: "{{ website_root }}/wordpress/wp-config.php"
+      owner: chinju
+      group: chinju
+      mode: '0644'
+
+  - name: Set permissions for phpMyAdmin directory
+    file:
+      path: /usr/share/phpMyAdmin
+      state: directory
+      owner: nginx
+      group: nginx
+      mode: '0775'
+
+  - name: Set permissions for PHP sessions directory
+    file:
+      path: /var/lib/php
+      state: directory
+      owner: nginx
+      group: nginx
+      mode: '0775'
+  
+  - name: Set permissions for all files & directories in phpMyAdmin directory
+    command: chown -R nginx:nginx /usr/share/phpMyAdmin
+    command: chmod -R 0775 /usr/share/phpMyAdmin
+  
+  - name: Set permissions for all files & directories in related PHP directory
+    command: chown -R nginx:nginx /var/lib/php
+    command: chmod -R 0775 /var/lib/php
+    command: chown -R nginx:nginx /run/php-fpm
+    command: chmod -R 0775 /run/php-fpm
+
+  - name: Restart Nginx and PHP-FPM
+    systemd:
+      name: "{{ item }}"
+      state: restarted
+    loop:
+      - nginx
+      - php-fpm
+
+  handlers:
+    - name: Restart sshd
+      systemd:
+        name: sshd
+        state: restarted
